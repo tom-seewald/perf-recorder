@@ -1,323 +1,313 @@
-###############################
-# Performance Recorder Script #
-###############################
+###############################################################################################
+# Performance Recorder Script 																  #
+# About: This is a simple wrapper around wpr.exe to facilitate end-users gathering ETW traces #
+# Script Author: Spectrum																	  #
+###############################################################################################
 
-# Check that this script is being run with elevated credentials, otherwise abort
+[CmdletBinding()]
+Param
+(
+	[bool]
+	$KeepPDB = $False
+)
 
-$elevatedcheck = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
-
-If ( "$elevatedcheck" -ne "True" ) {
-	
-	Write-Warning "ERROR: Administrator rights are required for this script to work properly!"
-	Write-Warning "Aborting script!"
-	exit
-}
-
-# Verify that wpr.exe exists, otherwise abort
-
-$wprcheck = Test-Path "$env:SystemRoot\System32\wpr.exe"
-
-If ( $wprcheck -ne "True" ) {
-
-	Write-Warning "ERROR: wpr.exe not found in System32 folder!"
-	Write-Warning "Aborting script!"
-	exit
-}
-
-# Ensure that wpr.exe is not already running
-
-wpr.exe -cancel 2> $null
-
-# Prompt user to choose what profiles to use
-
+# Required for drawing menus
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$form = New-Object System.Windows.Forms.Form 
-$form.Text = "WPR Profile Selection"
-$form.Size = New-Object System.Drawing.Size(300,280) 
-$form.StartPosition = "CenterScreen"
+$VersionString  = "Script Version: 7.28.18"
+$TimeStamp	    = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+$FolderName     = "$env:ComputerName-Trace-($TimeStamp)"
+$ZipName        = $FolderName + ".zip"
+$TempOutputPath = Join-Path -Path $env:Temp -ChildPath $FolderName
+$TempETLPath    = Join-Path -Path $TempOutputPath -ChildPath "trace.etl"
+$TranscriptPath = Join-Path -Path $TempOutputPath -ChildPath "log.txt"
+$SymbolPath     = $TempETLPath + ".NGENPDB"
+$WPR		    = "$env:SystemRoot\system32\wpr.exe"
+$ElevatedTest   = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")
+$WPRTest        = Test-Path -Path $WPR
 
-$OKButton = New-Object System.Windows.Forms.Button
-$OKButton.Location = New-Object System.Drawing.Point(95,205)
-$OKButton.Size = New-Object System.Drawing.Size(75,23)
-$OKButton.Text = "OK"
-$OKButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-$form.AcceptButton = $OKButton
-$form.Controls.Add($OKButton)
+# Get Windows Build
+$WindowsBuild = [System.Environment]::OSVersion.Version.Build
 
-$CancelButton = New-Object System.Windows.Forms.Button
-$CancelButton.Location = New-Object System.Drawing.Point(190,205)
-$CancelButton.Size = New-Object System.Drawing.Size(75,23)
-$CancelButton.Text = "Cancel"
-$CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-$form.CancelButton = $CancelButton
-$form.Controls.Add($CancelButton)
+# Minimum Windows Build supported
+$MinimumBuild = 10240
 
-$label = New-Object System.Windows.Forms.Label
-$label.Location = New-Object System.Drawing.Point(10,20) 
-$label.Size = New-Object System.Drawing.Size(280,20) 
-$label.Text = "Select one or more profiles from the list:"
-$form.Controls.Add($label) 
+# Time limits for tracing
+$LowerTimeLImitSeconds = 5
+$UpperTimeLimitSeconds = 600
+$ValidTimeRange        = $LowerTimeLimitSeconds..$UpperTimeLimitSeconds
 
-$listBox = New-Object System.Windows.Forms.Listbox 
-$listBox.Location = New-Object System.Drawing.Point(10,40) 
-$listBox.Size = New-Object System.Drawing.Size(260,20) 
+# WPR profiles
+$ValidProfiles =
+@(
+	"GeneralProfile",
+	"CPU",
+	"DiskIO",
+	"FileIO",
+	"Registry",
+	"Network",
+	"Heap",
+	"Pool",
+	"VirtualAllocation",
+	"Audio",
+	"Video",
+	"Power",
+	"InternetExplorer",
+	"EdgeBrowser",
+	"Minifilter",
+	"GPU",
+	"Handle",
+	"XAMLActivity",
+	"HTMLActivity",
+	"DesktopComposition",
+	"XAMLAppResponsiveness",
+	"HTMLResponsiveness",
+	"ReferenceSet",
+	"ResidentSet",
+	"XAMLHTMLAppMemoryAnalysis",
+	"UTC",
+	"DotNET",
+	"WdfTraceLoggingProvider",
+	"HeapSnapshot"
+)
 
-$listBox.SelectionMode = "MultiExtended"
-
-[void] $listBox.Items.Add("General Profile")
-[void] $listBox.Items.Add("CPU")
-[void] $listBox.Items.Add("Disk I/O")
-[void] $listBox.Items.Add("File I/O")
-[void] $listBox.Items.Add("GPU")
-[void] $listBox.Items.Add("Handles")
-[void] $listBox.Items.Add("Pool")
-[void] $listBox.Items.Add("Minifilter I/O")
-[void] $listBox.Items.Add("Network")
-[void] $listBox.Items.Add("Registry")
-[void] $listBox.Items.Add("Sound")
-[void] $listBox.Items.Add("Video")
-
-$listBox.Height = 170
-$form.Controls.Add($listBox) 
-$form.Topmost = $True
-
-$result = $form.ShowDialog()
-
-$selectedprofiles = $listBox.SelectedItems
-
-# If the user pressed cancel or closed the window, abort the script
-
-If ( $result -ne [System.Windows.Forms.DialogResult]::OK ) {
-		
-	Write-Warning "No items selected!"
-	Write-Warning "Aborting script"
-	exit
+# Verify that this script is being run with elevated credentials, if not, attempt to re-launch the script with elevated credentials
+If ( !$ElevatedTest )
+{
+	$CommandLine = "-File `"" + $MyInvocation.MyCommand.Path + "`" " + $MyInvocation.UnboundArguments
+	Start-Process -FilePath PowerShell.exe -Verb Runas -ArgumentList $CommandLine
+	Exit
 }
 
-# If the user selected 0 items and pressed OK, abort the script
-
-If ( !$selectedprofiles ) {
-
-	Write-Warning "No items selected!"
-	Write-Warning "Aborting script"
-	exit
+# Abort if wpr.exe is not found
+If ( !$WPRTest )
+{
+	Write-Warning "$WPR not found."
+	Stop-Transcript | Out-Null
+	Remove-Item -Recurse -Path $TempOutputPath -Force | Out-Null
+	Write-Warning "This script requires wpr.exe to run."
+	Return "Exiting script"
 }
 
-# If the user selected 1 or more items and pressed OK, print their selection and continue
+# Abort if we are not running Windows 10 or later, wpr.exe does not exist on releases before Windows 10
+If ( $WindowsBuild -lt $MinimumBuild )
+{
+	Write-Warning "This script can only run on Windows 10+"
+	Stop-Transcript | Out-Null
+	Remove-Item -Recurse -Path $TempOutputPath -Force | Out-Null
+	Write-Warning "This script only supports builds $MinimumBuild and greater. Detected Windows build: $WindowsBuild."
+	Return "Exiting script"
+}
 
-If ( $result -eq [System.Windows.Forms.DialogResult]::OK ) {
+Start-Transcript -Path $TranscriptPath -Force | Out-Null
+Write-Output $VersionString
+
+# Ensure that wpr.exe is not already running a trace, as it can only run one trace at a time
+$WPRStatus = &$WPR -Status | Select-Object -Last 1
+
+If ( $WPRStatus -ne "WPR is not recording" )
+{
+	Write-Output "wpr.exe is already running a trace, attempting to cancel it..."
+	&$WPR -Cancel 2> $null
+}
 	
-	Write-Host "`n"
-	Write-Host "Selected Profiles:"
-	Write-Host "`n"
-	$selectedprofiles
-	Write-Host "`n"
-}
+# Prompt user to choose what profiles to use
+$Form               = New-Object System.Windows.Forms.Form 
+$Form.Text          = "WPR Profile Selection"
+$Form.Size          = New-Object System.Drawing.Size(300,440) 
+$Form.StartPosition = "CenterScreen"
 
-# Create wpr.exe arguments from the profiles selected
+$OkButton 			   = New-Object System.Windows.Forms.Button
+$OkButton.Location     = New-Object System.Drawing.Point(50,370)
+$OkButton.Size         = New-Object System.Drawing.Size(75,23)
+$OkButton.Text         = "OK"
+$OkButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
 
-If ( $selectedprofiles -contains "General Profile" ) {
+$Form.AcceptButton = $OkButton
+$Form.Controls.Add($OkButton)
 
-	$wprarguments = $wprarguments + "-start GeneralProfile"
-}
-
-If ( $selectedprofiles -contains "CPU" ) {
-
-	$wprarguments = $wprarguments + "-start CPU"
-}
-
-If ( $selectedprofiles -contains "Disk I/O" ) {
-
-	$wprarguments = $wprarguments + "-start DiskIO"
-}	
-
-If ( $selectedprofiles -contains "File I/O" ) {
-
-	$wprarguments = $wprarguments + "-start FileIO"
-}
-
-If ( $selectedprofiles -contains "-start GPU" ) {
-
-	$wprarguments = $wprarguments + "-start GPU"
-}
-
-If ( $selectedprofiles -contains "Handles" ) {
-
-	$wprarguments = $wprarguments + "-start Handle"
-}
-
-If ( $selectedprofiles -contains "Registry" ) {
-
-	$wprarguments = $wprarguments + "-start Registry"
-}
-
-If ( $selectedprofiles -contains "Sound" ) {
-
-	$wprarguments = $wprarguments + "-start Audio"
-}
-
-If ( $selectedprofiles -contains "Video" ) {
-
-	$wprarguments = $wprarguments + "-start Video"
-}
-
-# Add a space between arguments
-
-$wprarguments = $wprarguments -replace "-", " -"
-
-# Remove the first leading space
-
-$wprarguments = $wprarguments -replace "^ -", "-"
-
-# Prompt user for amount of time (in seconds) the collection should run
-
-$form = New-Object System.Windows.Forms.Form 
-$form.Text = "Length of time"
-$form.Size = New-Object System.Drawing.Size(300,200) 
-$form.StartPosition = "CenterScreen"
-
-$OKButton = New-Object System.Windows.Forms.Button
-$OKButton.Location = New-Object System.Drawing.Point(75,120)
-$OKButton.Size = New-Object System.Drawing.Size(75,23)
-$OKButton.Text = "OK"
-$OKButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
-$form.AcceptButton = $OKButton
-$form.Controls.Add($OKButton)
-
-$CancelButton = New-Object System.Windows.Forms.Button
-$CancelButton.Location = New-Object System.Drawing.Point(150,120)
-$CancelButton.Size = New-Object System.Drawing.Size(75,23)
-$CancelButton.Text = "Cancel"
+$CancelButton              = New-Object System.Windows.Forms.Button
+$CancelButton.Location     = New-Object System.Drawing.Point(170,370)
+$CancelButton.Size         = New-Object System.Drawing.Size(75,23)
+$CancelButton.Text         = "Cancel"
 $CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-$form.CancelButton = $CancelButton
-$form.Controls.Add($CancelButton)
 
-$label = New-Object System.Windows.Forms.Label
-$label.Location = New-Object System.Drawing.Point(10,20) 
-$label.Size = New-Object System.Drawing.Size(280,20) 
-$label.Text = "Time, in seconds, that the trace will run (1-300)"
-$form.Controls.Add($label) 
+$Form.CancelButton = $CancelButton
+$Form.Controls.Add($CancelButton)
 
-$textBox = New-Object System.Windows.Forms.TextBox 
-$textBox.Location = New-Object System.Drawing.Point(10,40) 
-$textBox.Size = New-Object System.Drawing.Size(260,20) 
-$form.Controls.Add($textBox) 
+$Label          = New-Object System.Windows.Forms.Label
+$Label.Location = New-Object System.Drawing.Point(10,20) 
+$Label.Size     = New-Object System.Drawing.Size(280,20) 
+$Label.Text     = "Select one or more profiles from the list:"
+$Form.Controls.Add($Label) 
 
-$form.Topmost = $True
+$ListBox               = New-Object System.Windows.Forms.Listbox 
+$ListBox.Location      = New-Object System.Drawing.Point(10,40) 
+$ListBox.Size          = New-Object System.Drawing.Size(260,20) 
+$ListBox.SelectionMode = "MultiExtended"
+$ListBox.Height        = 320
 
-$form.Add_Shown({$textBox.Select()})
-$result = $form.ShowDialog()
+# Create a selectable item in the listBox for every entry in $ValidProfiles array.
+ForEach ( $Profile in $ValidProfiles )
+{
+	[void] $ListBox.Items.Add($Profile)
+}
 
-# Ensure the input is a decimal, if it is not a decimal this will set $timelimitseconds to $null
+$Form.Controls.Add($ListBox) 
+$Form.Topmost = $True
+$Result       = $Form.ShowDialog()
 
-$timelimitseconds = $textBox.Text -as [decimal]
+$SelectedProfiles = $ListBox.SelectedItems
+	
+# If the user pressed cancel or closed the window, or if the user selected 0 items and pressed OK, abort the script
+If ( ($Result -ne [System.Windows.Forms.DialogResult]::OK) -or !$SelectedProfiles )
+{		
+	Write-Warning "No profiles selected, exiting script."
+	Stop-Transcript | Out-Null
+	Remove-Item -Recurse -Path $TempOutputPath -Force | Out-Null
+	Exit
+}
+	
+# The user selected 1 or more profiles and pressed OK, print their selection and continue
+Write-Output "Selected Trace Profile(s):"
+$SelectedProfiles
 
+ForEach ( $Profile in $SelectedProfiles )
+{
+	$WPRArguments += "-Start $Profile "
+}
+
+# Prompt user for amount of time (in minutes) the collection should run
+$Form               = New-Object System.Windows.Forms.Form 
+$Form.Text          = "Trace duration"
+$Form.Size          = New-Object System.Drawing.Size(300,200) 
+$Form.StartPosition = "CenterScreen"
+
+$OkButton              = New-Object System.Windows.Forms.Button
+$OkButton.Location     = New-Object System.Drawing.Point(75,120)
+$OkButton.Size         = New-Object System.Drawing.Size(75,23)
+$OkButton.Text         = "OK"
+$OkButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+$Form.AcceptButton = $OkButton
+$Form.Controls.Add($OkButton)
+
+$CancelButton              = New-Object System.Windows.Forms.Button
+$CancelButton.Location     = New-Object System.Drawing.Point(150,120)
+$CancelButton.Size         = New-Object System.Drawing.Size(75,23)
+$CancelButton.Text         = "Cancel"
+$CancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+$Form.CancelButton = $CancelButton
+$Form.Controls.Add($CancelButton)
+
+$Label          = New-Object System.Windows.Forms.Label
+$Label.Location = New-Object System.Drawing.Point(10,20) 
+$Label.Size     = New-Object System.Drawing.Size(280,20) 
+$Label.Text     = "Time, in seconds, that the trace will run ($LowerTimeLimitSeconds-$UpperTimeLimitSeconds)"
+$Form.Controls.Add($Label) 
+
+$TextBox          = New-Object System.Windows.Forms.TextBox 
+$TextBox.Location = New-Object System.Drawing.Point(10,40) 
+$TextBox.Size     = New-Object System.Drawing.Size(260,20) 
+$Form.Controls.Add($TextBox) 
+
+$Form.Topmost = $True
+
+$Form.Add_Shown({$TextBox.Select()})
+$Result = $Form.ShowDialog()
+	
+# Ensure the input is an integer, otherwise this will set $TimeLimitSeconds to $null
+$TimeLimitSeconds = $TextBox.Text -as [int]
+
+Write-Output "Trace will run for $TimeLimitSeconds seconds."
+	
 # If the user pressed cancel or closed the window, abort the script
-
-If ( $result -ne [System.Windows.Forms.DialogResult]::OK ) {
-		
-	Write-Warning "Input box was closed or canceled!"
-	Write-Warning "Aborting script"
-	exit
+If ( $Result -ne [System.Windows.Forms.DialogResult]::OK )
+{
+	Write-Warning "Input box was closed or canceled."
+	Stop-Transcript | Out-Null
+	Remove-Item -Recurse -Path $TempOutputPath -Force | Out-Null
+	Exit
 }
 
 # If the user entered nothing or an invalid string and pressed OK, abort the script
-
-If ( !$timelimitseconds ) {
-
-	Write-Warning "Nothing was entered!"
-	Write-Warning "Aborting script"
-	exit
+If ( !$TimeLimitSeconds )
+{
+	Write-Warning "An invalid time value was entered."
+	Stop-Transcript | Out-Null
+	Remove-Item -Recurse -Path $TempOutputPath -Force | Out-Null
+	Exit
 }
 
-# If the entered amount is too high, abort the script
-
-If ( $timelimitseconds -gt 300 -or $timelimitseconds -lt 1 ) {
-	
-	Write-Warning "Invalid time limit"
-	Write-Warning "Aborting script"
-	exit
+# If the entered amount is out of range, abort the script
+If ( !($TimeLimitSeconds -in $ValidTimeRange) )
+{	
+	Write-Warning "Time limit must be between $LowerTimeLimitSeconds and $UpperTimeLimitSeconds seconds."
+	Stop-Transcript | Out-Null
+	Remove-Item -Recurse -Path $TempOutputPath -Force | Out-Null
+	Exit
 }
-  
+	  
 # Prompt user to choose where to place the output
-
-Write-Host "Please select the output directory for the trace"
-
-$FolderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+Write-Output "Select the output folder for the trace file."
+$FolderBrowser             = New-Object System.Windows.Forms.FolderBrowserDialog
+$FolderBrowser.Description = "Select the output folder for the trace file."
 [void]$FolderBrowser.ShowDialog()
 
-$date = Get-Date -format M-d-yyyy
+$SelectedFolder = $FolderBrowser.SelectedPath
 
-$folderpath = $FolderBrowser.SelectedPath
-  
-$outputpath = $FolderBrowser.SelectedPath + "\trace-($date).etl"
-
-$generated_symbols = "$outputpath" + ".etl.NGENPDB"
-
-Write-Host "`n"
-Write-Host "Selected output folder: $folderpath"
-Write-Host "`n"
-
-# Abort if path is empty
-
-If ( $folderpath -eq "" ) {
-
-	Write-Warning "Empty file path"
-	Write-Warning "Aborting script..."
-	exit
+If ( !$SelectedFolder )
+{
+	Write-Warning "No path selected."
+	Exit
 }
 
-# Abort if path selected is invalid
-
-If ( (Test-Path "$folderpath") -eq $False ) {
-
-	Write-Warning "Invalid path!"
-	Write-Warning "Aborting script..."
-	exit
+If ( !(Test-Path -Path $SelectedFolder -PathType Container) )
+{
+	Write-Warning "$SelectedFolder is not a valid directory."
+	Stop-Transcript | Out-Null
+	Remove-Item -Recurse -Path $TempOutputPath -Force | Out-Null
+	Exit
 }
 
-# If a name collision will occur, remove the old .etl file
-
-If ( Test-Path "$outputpath" ) {
-
-	Remove-Item "$outputpath"
-}
-
+Write-Output "Selected output path: $SelectedFolder"
+$OutputPath = Join-Path -Path $SelectedFolder -ChildPath $ZipName
+	
 # Start wpr.exe with the selected profiles
+Write-Output "Running ETW trace for $TimeLimitSeconds seconds..."
+Start-Process -FilePath $WPR -ArgumentList $WPRArguments -NoNewWindow
+	
+# Wait for the specified amount of time before stopping the trace
+Start-Sleep -Seconds $TimeLimitSeconds
 
-Write-Host "Running wpr.exe for $timelimitseconds seconds..."
-Write-Host "`n"
+# Once timelimit has been reached, stop trace and generate the .etl file
+Write-Output "Generating trace file..."
+&$WPR -Stop $TempETLPath
 
-Start-Process -FilePath "$env:SystemRoot\System32\wpr.exe" -ArgumentList $wprarguments -NoNewWindow
+# Wait for symbols to be generated, remove them
+Write-Output "Waiting for symbol generation..."
+Start-Sleep -Seconds 5
 
-# Wait for the specified amount of time before stopping collection
-
-$startDate = Get-Date
-
-While ( $startDate.AddSeconds($timelimitseconds) -gt (Get-Date) ) {
-
-	Start-Sleep -Seconds .5	
+If ( (Test-Path -Path $SymbolPath) -eq $True -and $KeepPDB -ne $True )
+{
+	Remove-Item -Recurse -Path $Symbolpath -Force 2> $null | Out-Null
 }
 
-# Once timelimit has been reached, stop collection and generate the .etl file
+Stop-Transcript | Out-Null
+Compress-Archive -Path "$TempOutputPath\*" -DestinationPath $OutputPath -CompressionLevel Optimal -Force
 
-If ( $startDate.AddSeconds($timelimitseconds) -le (Get-Date) ) {
-
-	Write-Host "Generating trace file..."
-
-	wpr.exe -stop "$outputpath"
+If ( $? -eq "True" -and (Test-Path -Path $OutputPath) -eq $True )
+{
+	Remove-Item -Recurse -Path $TempOutputPath -Force | Out-Null
+	Write-Output "Script complete, output: $OutputPath"
 }
 
-If ( Test-Path "$generated_symbols" ) { 
-
-	Remove-Item -Recurse "$generated_symbols"
+Else
+{
+	Write-Warning "Compression failed"
+	Write-Output "Script complete, output: $TempOutputPath"
 }
 
-Write-Host "`n"
-Write-Host "Performance Trace Complete!"
-Write-Host "`n"
-Write-Host "Output: $outputpath"
-Write-Host "`n"
-Read-Host -Prompt "Press Enter to Exit"
+Read-Host "Press Enter to close this window."
